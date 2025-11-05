@@ -1,0 +1,197 @@
+"""
+====================================================================
+ Smart Energy Use Forecasting Linked to Climate Factors
+====================================================================
+
+Description:
+    This Python script generates synthetic data to simulate energy
+    consumption influenced by climate and building-use factors. It
+    then trains and evaluates predictive models to forecast smart
+    energy usage under varying climatic conditions.
+
+    Key Features:
+    • Synthetic climate + occupancy data generation (3 years daily)
+    • Energy demand simulation (heating, cooling, occupancy effects)
+    • Linear Regression and Random Forest model training
+    • Performance evaluation and visualization
+    • Feature importance and coefficient analysis
+    • Export of generated dataset (CSV)
+
+Intended Use:
+    Educational / Research / Proof-of-Concept for smart energy analytics.
+
+====================================================================
+"""
+
+# -----------------------------
+#  Imports
+# -----------------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# -----------------------------
+# 1. Synthetic data generation
+# -----------------------------
+np.random.seed(42)
+start_date = datetime(2022, 1, 1)
+days = 3 * 365  # ~3 years
+dates = [start_date + timedelta(days=i) for i in range(days)]
+
+df = pd.DataFrame({"date": dates})
+df["day_of_year"] = df["date"].dt.dayofyear
+df["weekday"] = df["date"].dt.weekday
+df["is_weekend"] = (df["weekday"] >= 5).astype(int)
+
+# Climate variables
+avg_temp = 15
+amplitude = 10
+df["temp_C"] = avg_temp + amplitude * np.sin(2 * np.pi * (df["day_of_year"] / 365)) \
+               + np.random.normal(0, 3, len(df))
+
+df["humidity_pct"] = 60 - 0.5 * (df["temp_C"] - avg_temp) + np.random.normal(0, 8, len(df))
+df["humidity_pct"] = df["humidity_pct"].clip(10, 100)
+
+df["wind_m_s"] = 3 + 1.5 * np.cos(2 * np.pi * (df["day_of_year"] / 365)) + np.random.normal(0, 1, len(df))
+df["wind_m_s"] = df["wind_m_s"].clip(0.1)
+
+daylight_factor = 0.5 + 0.5 * np.sin(2 * np.pi * (df["day_of_year"] / 365))
+cloudiness = np.random.beta(a=2, b=5, size=len(df))
+df["solar_kwh_m2"] = 4.5 * daylight_factor * (1 - 0.6 * cloudiness) + np.random.normal(0, 0.3, len(df))
+df["solar_kwh_m2"] = df["solar_kwh_m2"].clip(0)
+
+precip_prob = 0.2
+df["precip_mm"] = (np.random.rand(len(df)) < precip_prob) * np.random.exponential(5, len(df))
+
+# Building-related factors
+df["occupancy"] = 0.5 + 0.3 * (1 - df["is_weekend"]) + np.random.normal(0, 0.1, len(df))
+df["occupancy"] = df["occupancy"].clip(0, 1)
+
+dow_base = {i: 20 + (0 if i < 5 else -3) for i in range(7)}
+df["base_kwh"] = df["weekday"].map(dow_base) + np.random.normal(0, 2, len(df))
+
+# -----------------------------
+# 2. Energy use simulation
+# -----------------------------
+k_h = 1.8  # heating load factor
+k_c = 2.2  # cooling load factor
+
+heating = np.maximum(0, 18 - df["temp_C"]) * k_h
+cooling = np.maximum(0, df["temp_C"] - 22) * k_c
+
+solar_effect = 0.2 * df["solar_kwh_m2"]
+cooling_adj = np.maximum(0, cooling - solar_effect)
+wind_effect = 0.3 * df["wind_m_s"]
+cooling_adj = np.maximum(0, cooling_adj - wind_effect)
+
+equip = df["base_kwh"] * (0.6 * df["occupancy"] + 0.4)
+trend = np.linspace(1.0, 0.95, len(df))
+noise = np.random.normal(0, 2, len(df))
+
+df["energy_kwh"] = (df["base_kwh"] * 0.4) + heating + cooling_adj + equip + noise
+df["energy_kwh"] = df["energy_kwh"] * trend
+df["energy_kwh"] = df["energy_kwh"].clip(5)
+
+# -----------------------------
+# 3. Feature engineering
+# -----------------------------
+df["temp_7d_avg"] = df["temp_C"].rolling(7, min_periods=1).mean()
+df["solar_7d_avg"] = df["solar_kwh_m2"].rolling(7, min_periods=1).mean()
+df["energy_lag_1"] = df["energy_kwh"].shift(1).bfill()
+
+features = [
+    "temp_C", "humidity_pct", "wind_m_s", "solar_kwh_m2", "precip_mm",
+    "occupancy", "base_kwh", "day_of_year", "is_weekend",
+    "temp_7d_avg", "solar_7d_avg", "energy_lag_1"
+]
+X = df[features]
+y = df["energy_kwh"]
+
+# -----------------------------
+# 4. Train-test split
+# -----------------------------
+split_idx = int(0.8 * len(df))
+X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+# -----------------------------
+# 5. Train models
+# -----------------------------
+lr = LinearRegression()
+lr.fit(X_train, y_train)
+
+rf = RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42)
+rf.fit(X_train, y_train)
+
+# -----------------------------
+# 6. Evaluate models
+# -----------------------------
+def evaluate(model, X_tr, y_tr, X_te, y_te, name):
+    pred_tr = model.predict(X_tr)
+    pred_te = model.predict(X_te)
+    return {
+        "Model": name,
+        "Train MAE": mean_absolute_error(y_tr, pred_tr),
+        "Test MAE": mean_absolute_error(y_te, pred_te),
+        "Train RMSE": mean_squared_error(y_tr, pred_tr, squared=False),
+        "Test RMSE": mean_squared_error(y_te, pred_te, squared=False),
+        "Train R2": r2_score(y_tr, pred_tr),
+        "Test R2": r2_score(y_te, pred_te)
+    }
+
+results = pd.DataFrame([
+    evaluate(lr, X_train, y_train, X_test, y_test, "LinearRegression"),
+    evaluate(rf, X_train, y_train, X_test, y_test, "RandomForest")
+])
+print("\n=== Model Evaluation ===")
+print(results.round(3))
+
+# -----------------------------
+# 7. Feature importance & plots
+# -----------------------------
+rf_importances = pd.Series(rf.feature_importances_, index=features).sort_values(ascending=False)
+lr_coeffs = pd.Series(lr.coef_, index=features).sort_values(key=abs, ascending=False)
+
+plt.figure(figsize=(10, 4))
+plt.plot(df["date"].iloc[split_idx:], y_test.values, label="Actual")
+plt.plot(df["date"].iloc[split_idx:], rf.predict(X_test), "--", label="RF Predicted")
+plt.legend()
+plt.title("Actual vs Predicted Energy (Random Forest)")
+plt.xlabel("Date")
+plt.ylabel("Energy (kWh)")
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8, 4))
+rf_importances.plot(kind="bar")
+plt.title("Random Forest Feature Importances")
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8, 4))
+lr_coeffs.plot(kind="bar")
+plt.title("Linear Regression Coefficients")
+plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# 8. Save dataset
+# -----------------------------
+df.to_csv("synthetic_energy_climate.csv", index=False)
+print("\n✅ Synthetic dataset saved as: synthetic_energy_climate.csv")
+
+# Optional: Show sample
+print("\n=== Sample Data ===")
+print(df.head(10))
+
+
+# ==============================================================
+#  Author & Metadata Section
+# ==============================================================
+__author__ = "Mr. [William Tarinabo]"
+__email__ = "[williamtarinabo@gmail.com]"
